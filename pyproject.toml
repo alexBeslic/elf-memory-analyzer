@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "elfmem"
+version = "0.1.0"
+description = "Desktop analyzer for embedded firmware ELF memory usage"
+requires-python = ">=3.10"
+dependencies = ["pyelftools>=0.31", "PySide6>=6.6"]
+
+[project.optional-dependencies]
+dev = ["pytest>=7", "pyinstaller>=6"]
+
+[project.scripts]
+elfmem = "elfmem.gui.app:main"
+elfmem-cli = "elfmem.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["elfmem*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
