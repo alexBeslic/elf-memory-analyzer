@@ -23,7 +23,9 @@ and assembly - from an ELF file, with no compiler required.
       debug_info.py         DWARF: declaration file/line, line table
       disassembler.py       objdump integration, parsing, source interleaving
       stack_usage.py        .su discovery, tolerant parsing, conservative matching
-      callgraph.py          call graph from disassembly + worst-case estimate with explicit limitations
+      callgraph.py          call graph from GCC .ci files (or disassembly) + worst-case estimate with explicit limitations
+      data_view.py          initial values of .data/.rodata objects read from the ELF image
+      region_import.py      memory regions from GNU ld .map files, linker scripts (MEMORY{}) and JSON
       memory_analyzer.py    region model, section/region accounting, top-N lists
       visualization.py      squarified treemap layout, chart data
       toolchain.py          presets, detection, validation, persisted config
@@ -43,13 +45,19 @@ Drag and drop an ELF (or a build directory) onto the window. Packaging: see `pac
 
 ## Typical workflow
 1. **Overview**: general info, warnings, section/category totals, largest functions/data.
-2. **Memory Map**: define regions (`FLASH 0x08000000 0x100000`, `RAM 0x20000000 0x20000`) to get usage percentages.
+2. **Memory Map**: import regions from a `.map` file / linker script / JSON (a `<elf-name>.map` next to the ELF is picked up
+   automatically), or type them in, to get usage percentages. Regions are remembered **per ELF**.
 3. **Functions / Global Data**: search (multi-term, address `0x...`), filter by size/section/address/stack, sort, export CSV.
-   Double-click a function to open the **Assembly** tab (source interleaved when DWARF exists).
-4. **Open build directory** (Ctrl+Shift+O): `.su` files are found recursively and matched to functions.
+   Double-click a function to open the **Assembly** tab (source interleaved when DWARF exists). For `.data`/`.rodata`
+   objects the same tab shows the **initial value** (hex dump, 8-64-bit integers, floats, C-string detection, load address
+   for `.data`); `.bss` objects say they are zero-initialized.
+4. **Open build directory** (Ctrl+Shift+O): `.su` files are found recursively and matched to functions; `.ci` files
+   (`-fcallgraph-info=su,da`, GCC 10+) feed the **Call Graph** page. Opening another ELF clears all of this.
 5. **Visualization**: treemap by section/category/region, click to inspect; bar charts of top consumers.
 6. **File -> Export** JSON / HTML / CSV.
 
+![Initial value of a read-only object](docs/screenshots/data_initial_value.png)
+![Call graph](docs/screenshots/callgraph.png)
 ![Visualization](docs/screenshots/visualization.png)
 
 ## How measurements are defined (read this)
@@ -65,14 +73,31 @@ Drag and drop an ELF (or a build directory) onto the window. Packaging: see `pac
 * `.su` records are matched in this order: exact name (raw or demangled, return type ignored) -> clone-suffix / parameter-less name
   (*approximate*) -> narrowed by translation unit (ELF `STT_FILE` or DWARF file). If several records or several symbols
   compete without evidence the result is **ambiguous and nothing is assigned**.
-* Per-function numbers are never summed. The optional call-path estimate (Stack Analysis page) reports a **lower bound**
-  when recursion, indirect calls, dynamic stack, or missing data are involved, and lists those issues.
+* Per-function numbers are never summed. The **Call Graph** page shows callees as a lazy tree (own stack and worst case from
+  each node, worst path in bold), callers of the selected node, and exports Graphviz DOT. The estimate is a **lower bound**
+  whenever recursion, indirect calls, dynamic stack, or missing data are involved, and the issues are listed.
+* Graph sources: GCC `.ci` files (exact: same-named statics are told apart by `<path>:<name>` titles, indirect calls and
+  per-function stack are recorded; `.ci` stack fills functions that have no `.su` record) with objdump disassembly as fallback.
+
+## Sessions and settings
+* Opening an ELF resets build directory, stack data, call graph and regions: nothing leaks from the previous firmware.
+  Regions are saved per ELF (`session/<hash>` in the Qt settings).
+* **View -> Reset window layout** re-docks the inspector and restores default columns; **Reset all saved settings** also
+  clears toolchain settings and per-ELF regions. The inspector always starts docked.
+* Toolchain: point *Toolchain folder* at the compiler/binutils folder and press **Scan** - see `docs/toolchain.md`.
 
 ## Tests
-    pytest -q          # 46 tests: ELF parsing vs nm/readelf/objdump, .su parsing/matching, exports, toolchain, GUI flow, 100k-symbol speed
+    pytest -q          # 64 tests: ELF parsing vs nm/readelf/objdump, .su/.ci parsing and matching, map/linker-script import,
+                   # initial values, toolchain scan, exports, GUI flows (incl. dock/resize regressions), 100k-symbol speed
 
 ## Known limitations / future work
 * `.su` is GCC-style; Clang uses the same parser but is untested against real Clang output. Other vendor formats need a parser plugin.
+* Map import understands the GNU ld **Memory Configuration** block, `MEMORY {}` linker scripts with numeric expressions, and JSON.
+  LLD / Tasking / IAR / Keil map formats are not parsed (use JSON or type the regions). Per-object/library attribution from
+  the map (which `.o` contributes how many bytes) is not implemented yet.
+* Initial values are shown as raw bytes with hints; no type-aware decoding of structs/arrays (DWARF types could add this).
+  Thread-local objects are not decoded.
+* `.ci` files need GCC 10+ (`-fcallgraph-info`); calls from assembly and interrupts are not part of any graph.
 * Call graph is heuristic (direct call/branch mnemonics from objdump; tail calls only when jumping to another function's entry);
   `-fcallgraph-info` (.ci) ingestion would be more precise. ISR entry points are not connected to callers.
 * Inlined or LTO-merged functions may have `.su` records with no ELF symbol (reported as unmatched).

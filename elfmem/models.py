@@ -132,6 +132,7 @@ class Symbol:
     stack_source: Optional[str] = None
     stack_note: str = ""
     alias_of: Optional[int] = None
+    shndx: int = -1
     notes: list[str] = field(default_factory=list)
     search_blob: str = ""
 

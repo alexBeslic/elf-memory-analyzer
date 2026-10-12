@@ -6,15 +6,16 @@ from typing import Optional
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout,
-                               QLabel, QLineEdit, QMessageBox, QPlainTextEdit, QPushButton, QSpinBox, QSplitter,
+                               QLabel, QLineEdit, QMessageBox, QPlainTextEdit, QPushButton, QSizePolicy, QSpinBox, QSplitter,
                                QTableView, QTableWidget, QTableWidgetItem, QTabWidget, QTextBrowser, QVBoxLayout,
                                QWidget)
 
 from ..analysis import AnalysisResult
 from ..export import render_report
 from ..memory_analyzer import MemoryRegion, top_sections, top_stack, top_symbols
+from ..region_import import RegionImportError, import_regions, regions_to_json
 from ..models import SymKind
-from ..toolchain import PRESETS, ROLES, ToolchainConfig, detect_tools, validate_config, validate_tool
+from ..toolchain import PRESETS, ROLES, ToolchainConfig, detect_tools, scan_toolchain_dir, validate_config, validate_tool
 from ..visualization import items_from_regions, items_from_sections, items_from_symbols
 from .charts import BarChartWidget, TreemapWidget
 from .tables import RowsModel
@@ -84,6 +85,10 @@ class MemoryMapPage(QWidget):
         self.regions.setHorizontalHeaderLabels(["Region name", "Origin (hex/dec)", "Length (bytes, hex/dec)"])
         self.regions.horizontalHeader().setStretchLastSection(True)
         add, rem, apply = QPushButton("Add region"), QPushButton("Remove selected"), QPushButton("Apply regions")
+        imp, exp = QPushButton("Import (.map / .ld / .json)…"), QPushButton("Export JSON…")
+        imp.setToolTip("Reads 'Memory Configuration' from a GNU ld map file, a MEMORY {} block from a linker script, or JSON")
+        imp.clicked.connect(self._import)
+        exp.clicked.connect(self._export)
         add.clicked.connect(lambda: self._add_row("", "", ""))
         rem.clicked.connect(lambda: [self.regions.removeRow(i) for i in sorted({x.row() for x in self.regions.selectedIndexes()}, reverse=True)])
         apply.clicked.connect(self._apply)
@@ -95,7 +100,7 @@ class MemoryMapPage(QWidget):
         bl.addWidget(hint)
         bl.addWidget(self.regions)
         row = QHBoxLayout()
-        for b in (add, rem, apply):
+        for b in (add, rem, apply, imp, exp):
             row.addWidget(b)
         row.addStretch(1)
         bl.addLayout(row)
@@ -120,7 +125,43 @@ class MemoryMapPage(QWidget):
         for r in regions:
             self._add_row(r.name, f"0x{r.origin:08x}", f"0x{r.length:x}")
 
+    def _import(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Import memory regions", "",
+                                              "Map / linker script / JSON (*.map *.ld *.lds *.json *.txt);;All files (*)")
+        if path:
+            self.import_file(path)
+
+    def import_file(self, path: str) -> bool:
+        try:
+            r = import_regions(path)
+        except RegionImportError as exc:
+            self.msg.setText(f"Import failed: {exc}")
+            return False
+        self.set_regions(r.regions)
+        extra = (" Notes: " + " | ".join(r.warnings)) if r.warnings else ""
+        self.msg.setText(f"Imported {len(r.regions)} region(s) from {r.kind}: {os.path.basename(path)}.{extra}")
+        self.regions_changed.emit(r.regions)
+        return True
+
+    def _export(self) -> None:
+        regions = self._parse_table()
+        if regions is None:
+            return
+        path, _ = QFileDialog.getSaveFileName(self, "Export memory regions", "memory_regions.json", "JSON (*.json)")
+        if path:
+            try:
+                with open(path, "w", encoding="utf-8") as fh:
+                    fh.write(regions_to_json(regions))
+            except OSError as exc:
+                self.msg.setText(f"Export failed: {exc}")
+
     def _apply(self) -> None:
+        out = self._parse_table()
+        if out is not None:
+            self.msg.setText(f"Applied {len(out)} region(s).")
+            self.regions_changed.emit(out)
+
+    def _parse_table(self):
         out: list[MemoryRegion] = []
         for r in range(self.regions.rowCount()):
             cells = [(self.regions.item(r, c).text().strip() if self.regions.item(r, c) else "") for c in range(3)]
@@ -132,14 +173,13 @@ class MemoryMapPage(QWidget):
                     raise ValueError
             except ValueError:
                 self.msg.setText(f"Row {r + 1}: need a name, a numeric origin and a positive length.")
-                return
+                return None
             out.append(MemoryRegion(name, origin, length))
         names = [m.name for m in out]
         if len(set(names)) != len(names):
             self.msg.setText("Region names must be unique.")
-            return
-        self.msg.setText(f"Applied {len(out)} region(s).")
-        self.regions_changed.emit(out)
+            return None
+        return out
 
     def set_result(self, res: AnalysisResult) -> None:
         e, m = res.elf, res.memory
@@ -175,7 +215,8 @@ class VisualizationPage(QWidget):
             self.group.addItem(label, v)
         self.min_size = QSpinBox(maximum=2_000_000_000, prefix="min ", suffix=" B", value=1, minimum=1)
         self.search = QLineEdit(placeholderText="Highlight objects by name…")
-        self.info = QLabel()
+        self.info = QLabel(wordWrap=True)
+        self.info.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         self.treemap = TreemapWidget()
         self.charts = {k: BarChartWidget() for k in ("Largest functions", "Largest data", "Largest sections", "Largest stack")}
         tabs = QTabWidget()
@@ -257,7 +298,7 @@ class StackPage(QWidget):
         self.summary = QLabel("No stack usage reports loaded.", wordWrap=True)
         self.model = RowsModel(["Name (as in .su)", "Stack (B)", "Class", "Source", ".su file", "Match", "Matched ELF symbol(s)"], (1,), {1: intf})
         self.table = make_table(self.model)
-        self.estimate_btn = QPushButton("Estimate call-path stack for selected function")
+        self.estimate_btn = QPushButton("Show call graph / worst-case stack for the selected function")
         self.estimate_btn.clicked.connect(self.estimate_requested.emit)
         self.estimate_out = QTextBrowser()
         self.estimate_out.setMaximumHeight(190)
@@ -313,7 +354,7 @@ class StackPage(QWidget):
             f"{counts.get('ambiguous', 0)} ambiguous, {counts.get('unavailable', 0)} without a record. "
             f"Unmatched records: {len(mr.unmatched_records) if mr else 0}.")
 
-    def show_estimate(self, html: str) -> None:
+    def show_estimate(self, html: str) -> None:  # kept for compatibility; estimates live on the Call Graph page
         self.estimate_out.setHtml(html)
 
 
@@ -326,7 +367,21 @@ class ToolchainPage(QWidget):
         for k, p in PRESETS.items():
             self.preset.addItem(p.label, k)
         self.edits: dict[str, QLineEdit] = {}
+        self.tc_dir = QLineEdit(placeholderText="Folder containing the compiler / binutils (e.g. .../tricore-gcc/bin) - tools are found automatically")
+        tb, ts = QPushButton("Browse…"), QPushButton("Scan")
+        tb.clicked.connect(self._browse_toolchain)
+        ts.clicked.connect(self._scan)
+        self.tc_prefix = QComboBox()
+        self.tc_prefix.setEditable(True)
+        self.tc_prefix.setToolTip("Tool name prefix, e.g. tricore-elf-  (tools are named <prefix>objdump, <prefix>nm, ...)")
+        self.tc_prefix.activated.connect(self._apply_candidate)   # user picked another prefix from the list
+        self._candidates = []
+        folder = QHBoxLayout()
+        for w in (self.tc_dir, tb, ts):
+            folder.addWidget(w)
         form = QFormLayout()
+        form.addRow("Toolchain folder", folder)
+        form.addRow("Tool prefix", self.tc_prefix)
         form.addRow("Preset", self.preset)
         for role in ROLES:
             e = QLineEdit(placeholderText="auto-detect from PATH" if role != "compiler" else "optional")
@@ -344,17 +399,10 @@ class ToolchainPage(QWidget):
         self.su_dialect.addItems(["gcc", "clang"])
         self.demangle = QCheckBox("Demangle C++ names")
         self.dwarf = QCheckBox("Read DWARF debug info in the background (source file/line)")
-        self.build_dir = QLineEdit(placeholderText="Default build output directory for .su files")
-        bb = QPushButton("Browse…")
-        bb.clicked.connect(lambda: self._browse_dir(self.build_dir))
-        brow = QHBoxLayout()
-        brow.addWidget(self.build_dir)
-        brow.addWidget(bb)
         form.addRow("objdump options", self.args)
         form.addRow("Stack report dialect", self.su_dialect)
         form.addRow("", self.demangle)
         form.addRow("", self.dwarf)
-        form.addRow("Build directory", brow)
         detect, validate, save = QPushButton("Detect tools"), QPushButton("Validate all"), QPushButton("Save && apply")
         detect.clicked.connect(self._detect)
         validate.clicked.connect(self._validate_all)
@@ -386,7 +434,8 @@ class ToolchainPage(QWidget):
         self.su_dialect.setCurrentText(cfg.su_dialect)
         self.demangle.setChecked(cfg.demangle)
         self.dwarf.setChecked(cfg.load_dwarf)
-        self.build_dir.setText(cfg.build_dir)
+        self.tc_dir.setText(cfg.toolchain_dir)
+        self.tc_prefix.setCurrentText(cfg.tool_prefix)
         self._base = cfg
 
     def config(self) -> ToolchainConfig:
@@ -396,7 +445,9 @@ class ToolchainPage(QWidget):
         for r, e in self.edits.items():
             setattr(c, r, e.text().strip())
         c.objdump_args, c.su_dialect = self.args.text().strip(), self.su_dialect.currentText()
-        c.demangle, c.load_dwarf, c.build_dir = self.demangle.isChecked(), self.dwarf.isChecked(), self.build_dir.text().strip()
+        c.demangle, c.load_dwarf = self.demangle.isChecked(), self.dwarf.isChecked()
+        c.toolchain_dir = self.tc_dir.text().strip()
+        c.tool_prefix = (self.tc_prefix.currentData() if self.tc_prefix.currentData() is not None else self.tc_prefix.currentText()).strip()
         return c
 
     def _browse(self, ed: QLineEdit) -> None:
@@ -404,10 +455,42 @@ class ToolchainPage(QWidget):
         if p:
             ed.setText(p)
 
-    def _browse_dir(self, ed: QLineEdit) -> None:
-        d = QFileDialog.getExistingDirectory(self, "Select directory", ed.text())
+    def _browse_toolchain(self) -> None:
+        d = QFileDialog.getExistingDirectory(self, "Select toolchain folder (the folder with the compiler / bin)", self.tc_dir.text())
         if d:
-            ed.setText(d)
+            self.tc_dir.setText(d)
+            self._scan()
+
+    def _scan(self) -> None:
+        """Find <prefix>objdump/nm/readelf/c++filt/gcc in the folder and fill all tool fields."""
+        root = self.tc_dir.text().strip()
+        self._candidates = scan_toolchain_dir(root) if root else []
+        self.tc_prefix.blockSignals(True)
+        self.tc_prefix.clear()
+        for c in self._candidates:
+            self.tc_prefix.addItem(f"{c.prefix or '(no prefix)'}   -  {len(c.tools)} tool(s) in {c.directory}", c.prefix)
+        self.tc_prefix.blockSignals(False)
+        if not self._candidates:
+            self.diag.setPlainText(f"No binutils/compiler tools found in {root or '(empty)'} or its bin subfolders.\n"
+                                   "Select the folder that contains files like <prefix>objdump and <prefix>gcc.")
+            return
+        self.tc_prefix.setCurrentIndex(0)
+        self._apply_candidate(0)
+
+    def _apply_candidate(self, index: int) -> None:
+        if not 0 <= index < len(self._candidates):
+            return
+        c = self._candidates[index]
+        for role, ed in self.edits.items():
+            ed.setText(c.tools.get(role, ""))
+        lines = [f"Prefix '{c.prefix}' in {c.directory}:"] + [f"  {r:9s} {c.tools.get(r, '- not found')}" for r in self.edits]
+        if len(self._candidates) > 1:
+            lines.append("Other prefixes found: " + ", ".join(repr(x.prefix) for x in self._candidates if x is not c)
+                         + "  (pick another in 'Tool prefix' if this is the wrong target)")
+        missing = [r for r in ("objdump",) if r not in c.tools]
+        if missing:
+            lines.append("WARNING: no objdump with this prefix - disassembly will not work.")
+        self.diag.setPlainText("\n".join(lines))
 
     def _preset_changed(self) -> None:
         c = self.config()

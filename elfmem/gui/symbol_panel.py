@@ -5,8 +5,8 @@ from typing import Optional
 
 from PySide6.QtCore import QSettings, Qt, QTimer, Signal
 from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QFileDialog, QHBoxLayout, QHeaderView,
-                               QLabel, QLineEdit, QMessageBox, QPushButton, QSpinBox, QTableView, QVBoxLayout,
-                               QWidget)
+                               QLabel, QLineEdit, QMessageBox, QPushButton, QSizePolicy, QSpinBox, QTableView,
+                               QVBoxLayout, QWidget)
 
 from ..export import export_symbols_csv
 from ..models import Symbol
@@ -33,8 +33,8 @@ class SymbolPanel(QWidget):
         self.max_size = QSpinBox(maximum=MAX_SPIN, prefix="max ", suffix=" B", specialValueText="max: any")
         self.section = QComboBox()
         self.section.addItem("All sections", "")
-        self.addr_min = QLineEdit(placeholderText="addr ≥ 0x...", maximumWidth=120)
-        self.addr_max = QLineEdit(placeholderText="addr ≤ 0x...", maximumWidth=120)
+        self.addr_min = QLineEdit(placeholderText="addr ≥ 0x...", maximumWidth=120, minimumWidth=70)
+        self.addr_max = QLineEdit(placeholderText="addr ≤ 0x...", maximumWidth=120, minimumWidth=70)
         self.extra = QComboBox()
         if is_function:
             for label, val in (("Stack: any", "any"), ("Has stack value", "has"), ("No stack value", "none"),
@@ -47,6 +47,13 @@ class SymbolPanel(QWidget):
                 self.extra.addItem(c, c)
         self.hide_alias = QCheckBox("Hide aliases")
         self.count = QLabel()
+        # Long, changing text must never force the window wider (this made the inspector dock unresizable).
+        self.count.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.count.setMinimumWidth(0)
+        for combo in (self.section, self.extra):
+            combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+            combo.setMinimumContentsLength(12)
+        self.search.setMinimumWidth(120)
         self.export_btn = QPushButton("Export CSV…")
         self.reset_btn = QPushButton("Reset filters")
 
@@ -67,18 +74,20 @@ class SymbolPanel(QWidget):
         self.table.sortByColumn(3, Qt.SortOrder.DescendingOrder)
         self._restore_header()
 
-        row1, row2 = QHBoxLayout(), QHBoxLayout()
+        row1, row2, row3 = QHBoxLayout(), QHBoxLayout(), QHBoxLayout()
         row1.addWidget(self.search, 1)
         row1.addWidget(self.export_btn)
-        for w in (self.min_size, self.max_size, self.section, self.addr_min, self.addr_max, self.extra,
-                  self.hide_alias, self.reset_btn):
+        for w in (self.min_size, self.max_size, self.section, self.extra):
             row2.addWidget(w)
         row2.addStretch(1)
-        row2.addWidget(self.count)
+        for w in (self.addr_min, self.addr_max, self.hide_alias, self.reset_btn):
+            row3.addWidget(w)
+        row3.addWidget(self.count, 1)
         lay = QVBoxLayout(self)
         lay.setContentsMargins(6, 6, 6, 6)
         lay.addLayout(row1)
         lay.addLayout(row2)
+        lay.addLayout(row3)
         lay.addWidget(self.table, 1)
 
         for sig in (self.search.textChanged, self.addr_min.textChanged, self.addr_max.textChanged):
@@ -142,6 +151,15 @@ class SymbolPanel(QWidget):
             QMessageBox.critical(self, "Export failed", str(exc))
             return
         QMessageBox.information(self, "Export complete", f"Wrote {n:,} rows to {path}")
+
+    def reset_header(self) -> None:
+        """Restore default column order, visibility and widths."""
+        h = self.table.horizontalHeader()
+        for logical in range(len(self.model.columns)):
+            h.moveSection(h.visualIndex(logical), logical)
+            h.setSectionHidden(logical, False)
+            self.table.setColumnWidth(logical, self.model.columns[logical].width)
+        self.table.sortByColumn(3, Qt.SortOrder.DescendingOrder)
 
     def save_header(self) -> None:
         QSettings("elfmem", "elfmem").setValue(f"header/{self.settings_key}", self.table.horizontalHeader().saveState())

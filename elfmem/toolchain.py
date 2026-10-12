@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -41,6 +42,7 @@ PRESETS: dict[str, Preset] = {p.name: p for p in [
            _gnu(["riscv-none-elf-", "riscv64-unknown-elf-", "riscv32-unknown-elf-"])),
     Preset("gnu-xtensa", "GNU Xtensa / ESP32 (xtensa-esp32-elf-)", "gcc", "gcc",
            _gnu(["xtensa-esp32-elf-", "xtensa-esp32s3-elf-", "xtensa-lx106-elf-"])),
+    Preset("gnu-tricore", "GNU TriCore (tricore-elf-)", "gcc", "gcc", _gnu(["tricore-elf-", "tricore-"])),
     Preset("gnu-avr", "GNU AVR (avr-)", "gcc", "gcc", _gnu(["avr-"])),
     Preset("clang-llvm", "Clang / LLVM", "clang", "clang",
            {"objdump": ["llvm-objdump"], "nm": ["llvm-nm"], "readelf": ["llvm-readelf"],
@@ -55,7 +57,7 @@ MACHINE_PREFIXES: dict[str, list[str]] = {
     "EM_AARCH64": ["aarch64-none-elf-", "aarch64-linux-gnu-"],
     "EM_RISCV": ["riscv-none-elf-", "riscv64-unknown-elf-", "riscv32-unknown-elf-", "riscv64-linux-gnu-"],
     "EM_XTENSA": ["xtensa-esp32-elf-", "xtensa-esp32s3-elf-", "xtensa-lx106-elf-"],
-    "EM_AVR": ["avr-"], "EM_MSP430": ["msp430-elf-"], "EM_MIPS": ["mips-linux-gnu-", "mipsel-linux-gnu-"],
+    "EM_TRICORE": ["tricore-elf-", "tricore-"], "EM_AVR": ["avr-"], "EM_MSP430": ["msp430-elf-"], "EM_MIPS": ["mips-linux-gnu-", "mipsel-linux-gnu-"],
     "EM_PPC": ["powerpc-eabi-", "powerpc-linux-gnu-"], "EM_386": [""], "EM_X86_64": [""],
 }
 
@@ -73,8 +75,10 @@ class ToolchainConfig:
     demangle: bool = True
     load_dwarf: bool = True
     su_dialect: str = "gcc"
-    build_dir: str = ""
-    memory_regions: list[dict] = field(default_factory=list)
+    build_dir: str = ""   # legacy; the build directory is now per ELF session and no longer persisted
+    memory_regions: list[dict] = field(default_factory=list)  # legacy; regions are stored per ELF
+    toolchain_dir: str = ""
+    tool_prefix: str = ""
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -180,11 +184,81 @@ def validate_config(cfg: ToolchainConfig) -> list[ToolCheck]:
     return checks
 
 
+@dataclass
+class ToolchainCandidate:
+    prefix: str
+    directory: str
+    tools: dict[str, str]
+
+    @property
+    def score(self) -> tuple:
+        return (int("objdump" in self.tools), len(self.tools), int(bool(self.prefix)))
+
+
+_ROLE_RE = {
+    "objdump": re.compile(r"^(?P<p>.*?)objdump$"), "nm": re.compile(r"^(?P<p>.*?)nm$"),
+    "readelf": re.compile(r"^(?P<p>.*?)readelf$"), "cxxfilt": re.compile(r"^(?P<p>.*?)c\+\+filt$|^(?P<p2>.*?)cxxfilt$"),
+    "compiler": re.compile(r"^(?P<p>.*?)(?:gcc|clang)(?:-\d+(?:\.\d+)*)?$"),
+}
+_BAD_PREFIX = ("gcc-", "g++-", "cc-", "c++-", "cpp-", "gcov-", "lto-")
+
+
+def _bin_dirs(root: str) -> list[str]:
+    root = os.path.abspath(root)
+    if os.path.isfile(root):
+        root = os.path.dirname(root)
+    dirs = [root, os.path.join(root, "bin")]
+    try:
+        for e in sorted(os.scandir(root), key=lambda x: x.name)[:80]:
+            if e.is_dir(follow_symlinks=False):
+                dirs += [os.path.join(e.path, "bin")]
+    except OSError:
+        pass
+    return [d for d in dirs if os.path.isdir(d)]
+
+
+def scan_toolchain_dir(root: str) -> list[ToolchainCandidate]:
+    """Find GNU/LLVM binutils-style tools in a toolchain folder (or its ``bin`` subfolders).
+
+    Tool names are ``<prefix><tool>`` (``tricore-elf-objdump``); every distinct prefix becomes a candidate,
+    best candidate first. Un-prefixed copies in nested ``<target>/bin`` folders rank below prefixed ones.
+    """
+    found: dict[str, ToolchainCandidate] = {}
+    for d in _bin_dirs(root):
+        try:
+            entries = sorted(os.scandir(d), key=lambda x: x.name)
+        except OSError:
+            continue
+        for e in entries:
+            if not e.is_file():
+                continue
+            stem = re.sub(r"\.(exe|bat|cmd)$", "", e.name, flags=re.I)
+            if os.name != "nt" and not os.access(e.path, os.X_OK):
+                continue
+            for role, rx in _ROLE_RE.items():
+                m = rx.match(stem)
+                if not m:
+                    continue
+                prefix = m.groupdict().get("p") or m.groupdict().get("p2") or ""
+                if prefix and (not prefix.endswith("-") or prefix.endswith(_BAD_PREFIX)):
+                    continue
+                cand = found.setdefault(prefix, ToolchainCandidate(prefix, d, {}))
+                cand.tools.setdefault(role, e.path)
+    return sorted(found.values(), key=lambda c: c.score, reverse=True)
+
+
 def resolve_tool(cfg: ToolchainConfig, role: str, machine: Optional[str] = None) -> str:
-    """Pick the executable for ``role``: explicit config > machine-specific names > preset names."""
+    """Pick the executable for ``role``: explicit path > toolchain folder (+prefix) > machine names > preset names."""
     explicit = getattr(cfg, role, "")
     if explicit:
         return shutil.which(explicit) or explicit
+    if cfg.toolchain_dir:
+        cands = scan_toolchain_dir(cfg.toolchain_dir)
+        if cfg.tool_prefix:
+            cands = [c for c in cands if c.prefix == cfg.tool_prefix] or cands
+        for c in cands:
+            if role in c.tools:
+                return c.tools[role]
     names: list[str] = []
     if machine and role != "compiler":
         names += [p + {"cxxfilt": "c++filt"}.get(role, role) for p in MACHINE_PREFIXES.get(machine, [])]

@@ -31,10 +31,12 @@ class MemoryRegion:
 
 
 def region_for(addr: int, regions: list[MemoryRegion]) -> Optional[str]:
+    """Name of the most specific (smallest) region containing ``addr``; overlapping regions are allowed."""
+    best: Optional[MemoryRegion] = None
     for r in regions:
-        if r.contains(addr):
-            return r.name
-    return None
+        if r.contains(addr) and (best is None or r.length < best.length):
+            best = r
+    return best.name if best else None
 
 
 @dataclass

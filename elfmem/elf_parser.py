@@ -147,7 +147,8 @@ def _read_symbols(model: ElfModel, table) -> None:
                      section=section.name if section else (str(shndx) if isinstance(shndx, str) else None),
                      kind=cls.kind, category=section.category if section else "",
                      data_class=cls.data_class, is_thumb=thumb,
-                     file_hint=current_file if bind == "LOCAL" else None, notes=cls.notes)
+                     file_hint=current_file if bind == "LOCAL" else None, notes=cls.notes,
+                     shndx=shndx if isinstance(shndx, int) else -1)
         syms.append(sym)
     model.symbols = syms
     _mark_aliases(syms)

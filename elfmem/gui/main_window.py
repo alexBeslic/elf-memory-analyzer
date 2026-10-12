@@ -1,6 +1,7 @@
 """Main application window: navigation, menus, background analysis orchestration."""
 from __future__ import annotations
 
+import hashlib
 import linecache
 import logging
 import os
@@ -9,16 +10,18 @@ from typing import Callable, Optional
 from PySide6.QtCore import QSettings, Qt
 from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (QApplication, QDockWidget, QFileDialog, QLabel, QListWidget, QMainWindow, QMessageBox,
-                               QProgressBar, QStackedWidget, QToolBar)
+                               QProgressBar, QSizePolicy, QStackedWidget, QToolBar)
 
 from .. import __version__
 from .. import analysis as an
-from ..callgraph import CallGraph, build_call_graph, estimate_worst_case
+from ..callgraph import CallGraph, apply_ci_stack, build_call_graph, build_call_graph_from_ci, discover_ci_files
 from ..disassembler import DisasmResult, disassemble, function_bounds
 from ..export import DATA_FIELDS, FUNCTION_FIELDS, export_html, export_json
 from ..memory_analyzer import MemoryRegion
 from ..models import SymKind
-from ..toolchain import ToolchainConfig, load_config, save_config
+from ..region_import import RegionImportError, import_regions
+from ..toolchain import ToolchainConfig, config_dir, load_config, save_config
+from .callgraph_page import CallGraphPage
 from .inspector import Inspector
 from .pages import LIMITATIONS, MemoryMapPage, OverviewPage, StackPage, ToolchainPage, VisualizationPage
 from .symbol_panel import SymbolPanel
@@ -26,7 +29,7 @@ from .tables import DATA_COLUMNS, FUNCTION_COLUMNS
 from .workers import Task
 
 log = logging.getLogger(__name__)
-PAGES = ["Overview", "Functions", "Global Data", "Memory Map", "Visualization", "Stack Analysis", "Toolchain Settings"]
+PAGES = ["Overview", "Functions", "Global Data", "Memory Map", "Visualization", "Stack Analysis", "Call Graph", "Toolchain Settings"]
 
 
 def _disasm_job(path: str, start: int, end: int, estimated: bool, cfg: ToolchainConfig, machine: str,
@@ -36,9 +39,14 @@ def _disasm_job(path: str, start: int, end: int, estimated: bool, cfg: Toolchain
     return d
 
 
-def _estimate_job(elf, cfg, symbols, root_addr, graph: Optional[CallGraph], progress=None):
-    g = graph or build_call_graph(elf, cfg, progress=progress)
-    return g, estimate_worst_case(g, symbols, root_addr)
+def _build_dir_job(directory: str, progress=None):
+    """Scan a build directory for .su stack reports and .ci call-graph files."""
+    parsed = an.load_stack_reports(directory, progress)
+    return parsed, discover_ci_files(directory)
+
+
+def _ci_job(elf, ci_files, progress=None) -> CallGraph:
+    return build_call_graph_from_ci(elf, ci_files, progress)
 
 
 class MainWindow(QMainWindow):
@@ -54,6 +62,8 @@ class MainWindow(QMainWindow):
         self._tasks: set[Task] = set()
         self._busy = 0
         self._graph: Optional[CallGraph] = None
+        self._ci_files: list = []
+        self._addr_sym: dict[int, int] = {}
 
         self.overview = OverviewPage()
         self.fn_panel = SymbolPanel("Functions", FUNCTION_COLUMNS, FUNCTION_FIELDS, True, "functions")
@@ -61,8 +71,10 @@ class MainWindow(QMainWindow):
         self.mem_page = MemoryMapPage()
         self.viz = VisualizationPage()
         self.stack_page = StackPage()
+        self.cg_page = CallGraphPage()
         self.tool_page = ToolchainPage(self.cfg)
-        self.pages = [self.overview, self.fn_panel, self.data_panel, self.mem_page, self.viz, self.stack_page, self.tool_page]
+        self.pages = [self.overview, self.fn_panel, self.data_panel, self.mem_page, self.viz, self.stack_page, self.cg_page,
+                      self.tool_page]
         self.stack = QStackedWidget()
         for p in self.pages:
             self.stack.addWidget(p)
@@ -70,13 +82,15 @@ class MainWindow(QMainWindow):
         self.nav.addItems(PAGES)
         self.nav.setMinimumWidth(150)
         self.nav.setMaximumWidth(190)
-        self.nav.currentRowChanged.connect(self.stack.setCurrentIndex)
+        self.nav.currentRowChanged.connect(self._page_changed)
         self.nav.setCurrentRow(0)
         from PySide6.QtWidgets import QSplitter
         split = QSplitter()
         split.addWidget(self.nav)
         split.addWidget(self.stack)
+        split.setStretchFactor(0, 0)
         split.setStretchFactor(1, 1)
+        split.setSizes([165, 1100])
         self.setCentralWidget(split)
 
         self.inspector = Inspector()
@@ -84,23 +98,25 @@ class MainWindow(QMainWindow):
         self.dock.setObjectName("inspector")
         self.dock.setWidget(self.inspector)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.dock)
-        self.dock.setMinimumWidth(430)
+        self.dock.setMinimumWidth(260)
 
         self.state_label = QLabel("No ELF loaded")
+        self.state_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)  # long text must not widen the window
+        self.state_label.setMinimumWidth(0)
         self.progress = QProgressBar(maximumWidth=160, maximum=0, visible=False)
         self.statusBar().addWidget(self.state_label, 1)
         self.statusBar().addPermanentWidget(self.progress)
 
         self._build_menus()
         self._wire()
-        self.mem_page.set_regions([MemoryRegion.from_dict(d) for d in self.cfg.memory_regions if _valid_region(d)])
-        if self.cfg.build_dir:
-            self.stack_page.set_directory(self.cfg.build_dir)
         geo, st = self.settings.value("window/geometry"), self.settings.value("window/state")
         if geo:
             self.restoreGeometry(geo)
         if st:
             self.restoreState(st)
+        # A floating/odd dock layout from an earlier session must never lock the window: always start docked.
+        self.dock.setFloating(False)
+        self.dock.show()
 
     # ------------------------------------------------------------------ setup
     def _act(self, text: str, slot: Callable, shortcut: str = "", tip: str = "") -> QAction:
@@ -134,6 +150,9 @@ class MainWindow(QMainWindow):
         vm.addSeparator()
         vm.addAction(self._act("Search in current page", self.focus_search, "Ctrl+F"))
         vm.addAction(self.dock.toggleViewAction())
+        vm.addSeparator()
+        vm.addAction(self._act("Reset window layout", self.reset_layout, tip="Re-dock the inspector and restore default columns"))
+        vm.addAction(self._act("Reset all saved settings…", self.reset_all_settings))
         hm = self.menuBar().addMenu("&Help")
         hm.addAction(self._act("Interpreting results / limitations", self.show_limitations))
         hm.addAction(self._act("About", self.show_about))
@@ -153,7 +172,11 @@ class MainWindow(QMainWindow):
         self.viz.section_requested.connect(self.show_section)
         self.mem_page.regions_changed.connect(self.on_regions_changed)
         self.stack_page.load_requested.connect(self.load_build_dir)
-        self.stack_page.estimate_requested.connect(self.estimate_stack)
+        self.stack_page.estimate_requested.connect(self.show_callgraph_for_selected)
+        self.cg_page.use_selected_requested.connect(self.show_callgraph_for_selected)
+        self.cg_page.rebuild_disasm_requested.connect(self.build_graph_from_disassembly)
+        self.cg_page.reload_ci_requested.connect(self.reload_ci)
+        self.cg_page.symbol_requested.connect(self.show_symbol_at_address)
         self.tool_page.config_changed.connect(self.on_config_changed)
 
     # ------------------------------------------------------------------ tasks
@@ -197,7 +220,7 @@ class MainWindow(QMainWindow):
             self.open_elf(path)
 
     def open_build_dialog(self) -> None:
-        d = QFileDialog.getExistingDirectory(self, "Select build output directory", self.cfg.build_dir)
+        d = QFileDialog.getExistingDirectory(self, "Select build output directory", self.stack_page.dir_edit.text())
         if d:
             self.stack_page.set_directory(d)
             self.load_build_dir(d)
@@ -206,12 +229,53 @@ class MainWindow(QMainWindow):
         if self.res:
             self.open_elf(self.res.elf.path)
 
+    # ---- per-ELF session state (regions are device specific; build dir/graph belong to one build)
+    @staticmethod
+    def _session_key(path: str) -> str:
+        return "session/" + hashlib.sha1(os.path.abspath(path).encode()).hexdigest()[:16]
+
+    def _load_session_regions(self, path: str) -> tuple[list[MemoryRegion], str]:
+        """Regions saved for this ELF, else regions found in a .map file next to it, else none."""
+        import json
+        raw = self.settings.value(self._session_key(path) + "/regions")
+        if raw:
+            try:
+                return [MemoryRegion.from_dict(d) for d in json.loads(raw)], "saved for this ELF"
+            except (ValueError, KeyError, TypeError):
+                pass
+        stem = os.path.splitext(path)[0]
+        for cand in (stem + ".map", path + ".map"):
+            if os.path.isfile(cand) and os.path.getsize(cand) < 300 * 1024 * 1024:
+                try:
+                    r = import_regions(cand)
+                    if r.regions:
+                        return r.regions, f"imported from {os.path.basename(cand)}"
+                except RegionImportError:
+                    continue
+        return [], ""
+
+    def _save_session_regions(self, regions: list) -> None:
+        import json
+        if self.res:
+            self.settings.setValue(self._session_key(self.res.elf.path) + "/regions",
+                                   json.dumps([r.to_dict() for r in regions]))
+
     def open_elf(self, path: str) -> None:
         self._gen += 1
         gen = self._gen
         self.settings.setValue("last_dir", os.path.dirname(path))
-        self._graph = None
-        regions = [MemoryRegion.from_dict(d) for d in self.cfg.memory_regions if _valid_region(d)]
+        # New ELF = clean slate: nothing from the previous firmware may leak into this one.
+        self._graph, self._ci_files, self._addr_sym = None, [], {}
+        self.res = None
+        self.stack_page.set_directory("")
+        self.stack_page.clear()
+        self.cg_page.set_graph(None, [])
+        self.cg_page.root = None
+        regions, how = self._load_session_regions(path)
+        self._region_note = f"Regions {how}" if how else ""
+        self.mem_page.set_regions(regions)
+        self.mem_page.msg.setText(f"{len(regions)} region(s) {how}." if regions else
+                                  "No memory regions defined for this ELF. Import a .map / linker script / JSON, or add regions.")
         self.run_task(an.analyze_elf, path, self.cfg, regions, message=f"Loading {os.path.basename(path)}…",
                       on_done=lambda r: self._elf_loaded(gen, r), on_fail=self._load_failed)
 
@@ -233,12 +297,17 @@ class MainWindow(QMainWindow):
         self.stack_page.clear()
         self.inspector.current = None
         self.inspector.title.setText("No symbol selected")
-        self.state_label.setText(f"{os.path.basename(e.path)} - {len(e.symbols):,} symbols; ELF analysis complete")
+        self._addr_sym = {}
+        for sym in res.functions:
+            if sym.alias_of is None:
+                self._addr_sym.setdefault(sym.address, sym.id)
+        self.cg_page.set_graph(None, res.elf.symbols)
+        self.inspector.view_stack.setCurrentWidget(self.inspector.placeholder)
+        self.state_label.setText(f"{os.path.basename(e.path)} - {len(e.symbols):,} symbols; ELF analysis complete"
+                                 + (f". {self._region_note}" if getattr(self, "_region_note", "") else ""))
         if self.cfg.load_dwarf and e.has_debug_info:
             self.run_task(an.load_debug, e.path, message="Reading DWARF debug info…",
                           on_done=lambda d: self._debug_loaded(gen, d), on_fail=lambda m: self._soft_fail("DWARF", m))
-        if self.cfg.build_dir and os.path.isdir(self.cfg.build_dir):
-            self.load_build_dir(self.cfg.build_dir)
 
     def _soft_fail(self, what: str, msg: str) -> None:
         self.state_label.setText(f"{what} failed: {msg}")
@@ -260,16 +329,58 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Invalid directory", f"Not a directory: {d!r}")
             return
         gen = self._gen
-        self.cfg.build_dir = d
-        self.run_task(an.load_stack_reports, d, message="Scanning for .su files…",
-                      on_done=lambda p: self._stack_loaded(gen, p), on_fail=lambda m: self._soft_fail("Stack usage", m))
+        self.stack_page.set_directory(d)
+        self.run_task(_build_dir_job, d, message="Scanning build directory for .su / .ci files…",
+                      on_done=lambda r: self._stack_loaded(gen, r), on_fail=lambda m: self._soft_fail("Stack usage", m))
 
-    def _stack_loaded(self, gen: int, parsed) -> None:
+    def _stack_loaded(self, gen: int, result) -> None:
         if gen != self._gen or not self.res:
             return
+        parsed, ci_files = result
         an.apply_stack(self.res, parsed)
+        self._ci_files = ci_files
         self.stack_page.set_result(self.res)
-        self._refresh_all(f"Stack usage loaded: {len(parsed.records):,} records from {len(parsed.files)} files")
+        msg = f"Stack usage loaded: {len(parsed.records):,} records from {len(parsed.files)} .su files"
+        if ci_files:
+            msg += f"; reading {len(ci_files)} .ci call-graph files…"
+            self.run_task(_ci_job, self.res.elf, ci_files, message="Reading compiler call-graph info…",
+                          on_done=lambda g: self._graph_ready(gen, g), on_fail=lambda m: self._soft_fail("Call graph", m))
+        else:
+            msg += ". No .ci files found (compile with -fcallgraph-info=su,da for a compiler call graph)"
+        self._refresh_all(msg)
+
+    def _graph_ready(self, gen: int, graph: CallGraph) -> None:
+        if gen != self._gen or not self.res:
+            return
+        self._graph = graph
+        n = apply_ci_stack(self.res.elf.symbols, graph)
+        self.cg_page.set_graph(graph, self.res.elf.symbols)
+        self._refresh_all(f"Call graph ready ({graph.origin}); {n} function(s) got stack data from .ci")
+        self.stack_page.set_result(self.res)
+
+    def reload_ci(self) -> None:
+        d = self.stack_page.dir_edit.text().strip()
+        if d and os.path.isdir(d):
+            self.load_build_dir(d)
+        else:
+            QMessageBox.information(self, "No build directory", "Choose a build directory on the Stack Analysis page first.")
+
+    def build_graph_from_disassembly(self) -> None:
+        if not self.res:
+            return
+        gen = self._gen
+        self.run_task(build_call_graph, self.res.elf, self.cfg, message="Building call graph from disassembly…",
+                      on_done=lambda g: self._disasm_graph_ready(gen, g), on_fail=lambda m: self._soft_fail("Call graph", m))
+
+    def _disasm_graph_ready(self, gen: int, graph: CallGraph) -> None:
+        if gen != self._gen or not self.res:
+            return
+        if not graph.edges and graph.warnings:
+            QMessageBox.warning(self, "Call graph", "\n".join(graph.warnings))
+        self._graph = graph
+        self.cg_page.set_graph(graph, self.res.elf.symbols)
+        self._show_selected_in_graph()
+        self.state_label.setText(f"Call graph built from disassembly ({sum(len(v) for v in graph.edges.values()):,} edges)")
 
     def _refresh_all(self, msg: str) -> None:
         if not self.res:
@@ -290,13 +401,44 @@ class MainWindow(QMainWindow):
     def on_symbol_selected(self, sid: int) -> None:
         if self.res:
             self.inspector.show_symbol(self.res, self.res.elf.symbols[sid])
+            if self.stack.currentWidget() is self.cg_page:
+                self._show_selected_in_graph()
+
+    def _page_changed(self, row: int) -> None:
+        self.stack.setCurrentIndex(row)
+        if self.stack.currentWidget() is self.cg_page:
+            self._show_selected_in_graph()
+
+    def _show_selected_in_graph(self) -> bool:
+        sym = self.inspector.current
+        if self._graph is not None and sym is not None and sym.kind == SymKind.FUNCTION:
+            return self.cg_page.show_root(sym.address)
+        return False
+
+    def show_callgraph_for_selected(self) -> None:
+        if not self.res:
+            return
+        sym = self.inspector.current
+        if sym is None or sym.kind != SymKind.FUNCTION:
+            QMessageBox.information(self, "Select a function", "Select a function on the Functions page first.")
+            return
+        self.nav.setCurrentRow(PAGES.index("Call Graph"))
+        if self._graph is None:
+            self.build_graph_from_disassembly()   # no .ci data loaded: fall back to disassembly
+        else:
+            self._show_selected_in_graph()
+
+    def show_symbol_at_address(self, addr: int) -> None:
+        sid = self._addr_sym.get(addr)
+        if sid is not None:
+            self.show_symbol(sid)
 
     def on_symbol_activated(self, sid: int) -> None:
         self.on_symbol_selected(sid)
         self.dock.show()
         sym = self.res.elf.symbols[sid] if self.res else None
-        if sym and sym.kind == SymKind.FUNCTION:
-            self.inspector.tabs.setCurrentWidget(self.inspector.asm)
+        if sym and sym.kind in (SymKind.FUNCTION, SymKind.DATA):
+            self.inspector.tabs.setCurrentWidget(self.inspector.view_stack)
 
     def show_symbol(self, sid: int) -> None:
         if not self.res:
@@ -338,8 +480,7 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------------ regions / config
     def on_regions_changed(self, regions: list) -> None:
-        self.cfg.memory_regions = [r.to_dict() for r in regions]
-        save_config(self.cfg)
+        self._save_session_regions(regions)
         if self.res:
             an.recompute_memory(self.res, regions)
             self.mem_page.set_result(self.res)
@@ -347,9 +488,9 @@ class MainWindow(QMainWindow):
             self.data_panel.refresh()
             self.overview.show_result(self.res)
             self.viz.set_result(self.res)
+            self.state_label.setText(f"{len(regions)} memory region(s) applied to this ELF")
 
     def on_config_changed(self, cfg: ToolchainConfig) -> None:
-        cfg.memory_regions = self.cfg.memory_regions
         self.cfg = cfg
         try:
             save_config(cfg)
@@ -359,33 +500,37 @@ class MainWindow(QMainWindow):
         if self.inspector.current:
             self.inspector.show_symbol(self.res, self.inspector.current)
 
-    # ------------------------------------------------------------------ stack estimate
-    def estimate_stack(self) -> None:
-        sym = self.inspector.current
-        if not self.res or not sym or sym.kind != SymKind.FUNCTION:
-            QMessageBox.information(self, "Select a function", "Select a function (Functions page) first.")
-            return
-        if not self.res.su:
-            QMessageBox.information(self, "No stack data", "Load a build directory with .su files first.")
-            return
-        self.run_task(_estimate_job, self.res.elf, self.cfg, self.res.elf.symbols, sym.address, self._graph,
-                      message=f"Estimating call-path stack for {sym.display_name}…",
-                      on_done=lambda r: self._estimate_done(sym, r))
+    # ------------------------------------------------------------------ reset
+    def reset_layout(self) -> None:
+        """Re-dock the inspector, restore default window size and table columns."""
+        for key in ("window/geometry", "window/state", "header/functions", "header/data"):
+            self.settings.remove(key)
+        self.dock.setFloating(False)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.dock)
+        self.dock.show()
+        self.resize(1500, 920)
+        self.resizeDocks([self.dock], [460], Qt.Orientation.Horizontal)
+        self.fn_panel.reset_header()
+        self.data_panel.reset_header()
+        self.state_label.setText("Window layout reset")
 
-    def _estimate_done(self, sym, result) -> None:
-        from html import escape
-        graph, est = result
-        self._graph = graph
-        names = " → ".join(escape(graph.names.get(a, f"0x{a:x}")) for a in est.path[:25])
-        verdict = ("<b>No limiting issues found along the analysed paths.</b> Interrupts and unseen callers are still not included."
-                   if est.reliable else
-                   f"<b>Lower bound only</b> - a reliable worst case cannot be established.")
-        issues = "".join(f"<li>{escape(i)}</li>" for i in est.issues[:40]) or "<li>none</li>"
-        warns = "".join(f"<li>{escape(w)}</li>" for w in graph.warnings)
-        self.stack_page.show_estimate(
-            f"<h4>{escape(sym.display_name)}: ≥ {est.bound:,} bytes along the deepest known path</h4><p>{verdict}</p>"
-            f"<p>Path: {names}</p><p>Issues:</p><ul>{issues}</ul><ul>{warns}</ul>{LIMITATIONS}")
-        self.nav.setCurrentRow(5)
+    def reset_all_settings(self) -> None:
+        if QMessageBox.question(self, "Reset all saved settings", "Forget window layout, column layouts, per-firmware "
+                                "memory regions and toolchain settings?") != QMessageBox.StandardButton.Yes:
+            return
+        self.settings.clear()
+        try:
+            (config_dir() / "toolchain.json").unlink(missing_ok=True)
+        except OSError:
+            pass
+        self.cfg = ToolchainConfig()
+        self.tool_page.set_config(self.cfg)
+        self.mem_page.set_regions([])
+        if self.res:
+            an.recompute_memory(self.res, [])
+            self.mem_page.set_result(self.res)
+            self._refresh_all("settings reset")
+        self.reset_layout()
 
     # ------------------------------------------------------------------ export / help
     def _export(self, title: str, default: str, filt: str, fn) -> None:
@@ -439,16 +584,4 @@ class MainWindow(QMainWindow):
         self.settings.setValue("window/state", self.saveState())
         self.fn_panel.save_header()
         self.data_panel.save_header()
-        try:
-            save_config(self.cfg)
-        except OSError:
-            pass
         super().closeEvent(e)
-
-
-def _valid_region(d: dict) -> bool:
-    try:
-        MemoryRegion.from_dict(d)
-        return True
-    except (KeyError, ValueError, TypeError):
-        return False

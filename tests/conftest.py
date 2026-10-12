@@ -18,7 +18,7 @@ def build(tmp_path_factory):
     root = tmp_path_factory.mktemp("fw")
     (root / "app").mkdir()
     (root / "lib" / "nested").mkdir(parents=True)
-    flags = ["-g", "-O1", "-fstack-usage", "-ffunction-sections", "-fdata-sections"]
+    flags = ["-g", "-O1", "-fstack-usage", "-fcallgraph-info=su,da", "-ffunction-sections", "-fdata-sections"]
     objs = []
     for cc, src, out in ((gcc, "main.c", "app/main.o"), (gcc, "other.c", "lib/nested/other.o"),
                          (gxx, "cxx.cpp", "lib/cxx.o")):
