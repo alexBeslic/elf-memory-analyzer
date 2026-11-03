@@ -386,7 +386,8 @@ def to_dot(graph: CallGraph, symbols: list[Symbol], root: Optional[int] = None, 
         st = look.get(k)
         label = graph.node_name(k) + (f"\\n{st[0]} B ({st[1]})" if st else "")
         extra = " style=dashed" if k < 0 else (" color=red" if k in graph.indirect else "")
-        lines.append(f"  n{k + 10**12} [label={q(label).replace('\\\\n', '\\n')}{extra}];")
+        quoted = q(label).replace("\\\\n", "\\n")
+        lines.append(f"  n{k + 10**12} [label={quoted}{extra}];")
     for a in sorted(keys):
         for b in sorted(graph.edges.get(a, ())):
             if b in keys:
